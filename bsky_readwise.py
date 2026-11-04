@@ -46,13 +46,21 @@ def request(method, url, *, headers=None, body=None, params=None, retries=4):
                 raw = resp.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < retries:
-                wait = int(e.headers.get("Retry-After") or 10 * (attempt + 1))
-                print(f"  rate limited, sleeping {wait}s", file=sys.stderr)
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
+                wait = int(e.headers.get("Retry-After") or 5 * 2**attempt)
+                print(f"  {endpoint} -> {e.code}, retrying in {wait}s", file=sys.stderr)
                 time.sleep(wait)
                 continue
-            detail = re.sub(r"at://\S+?(?=[\s\"']|$)", "at://…", e.read().decode(errors="replace"))[:500]
+            detail = e.read().decode(errors="replace").strip()
+            if detail.startswith("<"):
+                detail = "(HTML error page)"
+            detail = re.sub(r"at://\S+?(?=[\s\"']|$)", "at://…", detail)[:300]
             raise RuntimeError(f"{method} {endpoint} -> {e.code}: {detail}") from None
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < retries:
+                time.sleep(5 * 2**attempt)
+                continue
+            raise RuntimeError(f"{method} {endpoint} -> network error: {e}") from None
 
 
 # ------------------------------------------------------------------------ bluesky
@@ -234,10 +242,8 @@ def readwise_headers(token):
     return {"Authorization": f"Token {token}"}
 
 
-def push_highlights(token, highlights, batch=100):
-    for i in range(0, len(highlights), batch):
-        request("POST", READWISE_HIGHLIGHTS, headers=readwise_headers(token),
-                body={"highlights": highlights[i : i + batch]})
+def push_highlight(token, highlight):
+    request("POST", READWISE_HIGHLIGHTS, headers=readwise_headers(token), body={"highlights": [highlight]})
 
 
 def push_reader(token, doc):
@@ -256,14 +262,18 @@ def state_key(uri, secret):
 
 
 def load_state(path):
+    """Return (synced hashes, whether the last run left failures behind)."""
     try:
-        return set(json.loads(Path(path).read_text())["synced"])
+        state = json.loads(Path(path).read_text())
+        return set(state["synced"]), bool(state.get("incomplete"))
     except (FileNotFoundError, KeyError, json.JSONDecodeError):
-        return set()
+        return set(), False
 
 
-def save_state(path, synced):
-    Path(path).write_text(json.dumps({"synced": sorted(synced)}, indent=1))
+def save_state(path, synced, incomplete):
+    tmp = Path(f"{path}.tmp")
+    tmp.write_text(json.dumps({"synced": sorted(synced), "incomplete": incomplete}, indent=1))
+    tmp.replace(path)
 
 
 def main():
@@ -287,41 +297,54 @@ def main():
     if missing:
         sys.exit(f"missing env vars: {', '.join(missing)}")
 
-    synced = load_state(args.state)
+    synced, incomplete = load_state(args.state)
     key = lambda uri: state_key(uri, env["BSKY_APP_PASSWORD"])
     is_known = lambda uri: key(uri) in synced
     bsky = Bluesky(env["BSKY_HANDLE"], env["BSKY_APP_PASSWORD"], env.get("BSKY_SERVICE", "https://bsky.social"))
 
-    new = [b for b in bsky.bookmarks(is_known, args.full) if not is_known(b["subject"]["uri"])]
+    # After a run with failures, re-scan every page so older failed posts get retried.
+    new = [b for b in bsky.bookmarks(is_known, args.full or incomplete) if not is_known(b["subject"]["uri"])]
     new.reverse()  # oldest first
     print(f"{len(new)} new bookmark(s)")
 
-    highlights = []
-    for b in new:
-        item = b.get("item", {})
-        if not item.get("$type", "").endswith("#postView"):
-            log(f"  skip unavailable post {b['subject']['uri']}")
+    failed = 0
+    try:
+        for i, b in enumerate(new, 1):
+            item = b.get("item", {})
+            if not item.get("$type", "").endswith("#postView"):
+                log(f"  skip unavailable post {b['subject']['uri']}")
+                synced.add(key(b["subject"]["uri"]))
+                continue
+            posts = [item] + (bsky.self_thread(item) if args.threads else [])
+            if args.dry_run:
+                if args.dest in ("readwise", "both"):
+                    print(json.dumps({"highlight": to_highlight(b, posts)}, indent=2))
+                if args.dest in ("reader", "both"):
+                    print(json.dumps({"reader": to_reader_doc(b, posts)}, indent=2))
+                continue
+            try:
+                if args.dest in ("reader", "both"):
+                    push_reader(env["READWISE_TOKEN"], to_reader_doc(b, posts))
+                if args.dest in ("readwise", "both"):
+                    push_highlight(env["READWISE_TOKEN"], to_highlight(b, posts))
+            except RuntimeError as e:
+                # Leave it unsynced; the next run retries it.
+                failed += 1
+                print(f"  failed to send a post: {e}", file=sys.stderr)
+                continue
             synced.add(key(b["subject"]["uri"]))
-            continue
-        posts = [item] + (bsky.self_thread(item) if args.threads else [])
-        if args.dry_run:
-            if args.dest in ("readwise", "both"):
-                print(json.dumps({"highlight": to_highlight(b, posts)}, indent=2))
-            if args.dest in ("reader", "both"):
-                print(json.dumps({"reader": to_reader_doc(b, posts)}, indent=2))
-            continue
-        if args.dest in ("reader", "both"):
-            push_reader(env["READWISE_TOKEN"], to_reader_doc(b, posts))
-        if args.dest in ("readwise", "both"):
-            highlights.append(to_highlight(b, posts))
-        synced.add(key(b["subject"]["uri"]))
-        log(f"  {post_url(item['uri'])}")
+            log(f"  {post_url(item['uri'])}")
+            if i % 25 == 0:
+                print(f"  {i}/{len(new)}")
+                save_state(args.state, synced, True)
+    finally:
+        if not args.dry_run:
+            save_state(args.state, synced, failed > 0 or sys.exc_info()[0] is not None)
 
-    if highlights:
-        push_highlights(env["READWISE_TOKEN"], highlights)
-    if not args.dry_run:
-        save_state(args.state, synced)
-
+    print(f"sent {len(new) - failed}, failed {failed}")
+    if failed:
+        # Shows as a warning in GitHub Actions without failing the run.
+        print(f"::warning::{failed} post(s) could not be sent and will be retried next run")
 
 if __name__ == "__main__":
     main()
