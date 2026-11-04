@@ -1,0 +1,33 @@
+name: Sync Bluesky bookmarks to Readwise
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly
+  workflow_dispatch:
+
+concurrency: sync
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # state.json remembers which posts were already sent; carry it between runs.
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      - run: python bsky_readwise.py --dest "${{ vars.DEST || 'both' }}" ${{ vars.THREADS == 'true' && '--threads' || '' }}
+        env:
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+          READWISE_TOKEN: ${{ secrets.READWISE_TOKEN }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
