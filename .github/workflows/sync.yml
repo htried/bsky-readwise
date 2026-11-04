@@ -11,12 +11,12 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # state.json remembers which posts were already sent; carry it between runs.
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@v6
         with:
           path: state.json
           key: state-${{ github.run_id }}
@@ -26,7 +26,7 @@ jobs:
           BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
           BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
           READWISE_TOKEN: ${{ secrets.READWISE_TOKEN }}
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@v6
         if: always()
         with:
           path: state.json
